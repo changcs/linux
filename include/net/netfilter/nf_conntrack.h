@@ -272,7 +272,7 @@ extern struct nf_conn *
 nf_conntrack_alloc(struct net *net,
 		   const struct nf_conntrack_tuple *orig,
 		   const struct nf_conntrack_tuple *repl,
-		   gfp_t gfp);
+		   gfp_t gfp, struct sk_buff *skb);
 
 /* It's confirmed if it is, or has been in the hash table. */
 static inline int nf_ct_is_confirmed(struct nf_conn *ct)
@@ -293,6 +293,34 @@ static inline int nf_ct_is_untracked(const struct sk_buff *skb)
 extern int nf_conntrack_set_hashsize(const char *val, struct kernel_param *kp);
 extern unsigned int nf_conntrack_htable_size;
 extern unsigned int nf_conntrack_max;
+
+struct nf_conn_lan {
+	/* network order */
+	u32 ipaddr;
+	/* conntrack number of this ip */
+	int count;
+	struct list_head list;
+};
+
+extern struct kmem_cache *nf_ct_natlan_cachep;
+
+extern void get_wan_traffic_destined_to_router_ports(struct net *net);
+extern int tuple_initiated_from_inside(const struct nf_conntrack_tuple *tuple);
+extern int tuple_is_router_traffic(const struct nf_conntrack_tuple *tuple);
+extern int skb_is_ipv6_packet(struct sk_buff *skb);
+extern int conntrack_table_really_full(struct net *net);
+extern u32 lan_ip_of_wan_orig_tuple(struct net *net, struct sk_buff *skb,
+				    const struct nf_conntrack_tuple *orig);
+extern unsigned int number_of_session(struct net *net, u32 lan_ip);
+extern u32 get_lan_ip_max_from_conntracks(struct net *net,
+					  unsigned int *sessions_of_ip_max);
+extern
+struct nf_conn *find_victim_from_conntracks(struct net *net,
+					    struct nf_conntrack_tuple *orig,
+					    struct nf_conntrack_tuple *repl,
+					    u32 lan_ip_new, u32 lan_ip_max,
+					    unsigned int sessions_of_ip_new,
+					    unsigned int sessions_of_ip_max);
 
 #define NF_CT_STAT_INC(net, count)	\
 	(per_cpu_ptr((net)->ct.stat, raw_smp_processor_id())->count++)

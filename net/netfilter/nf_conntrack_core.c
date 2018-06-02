@@ -67,6 +67,10 @@ static struct kmem_cache *nf_conntrack_cachep __read_mostly;
 static int nf_conntrack_hash_rnd_initted;
 static unsigned int nf_conntrack_hash_rnd;
 
+struct kmem_cache *nf_ct_natlan_cachep;
+
+int sysctl_enable_nat_management = 0;
+
 static u_int32_t __hash_conntrack(const struct nf_conntrack_tuple *tuple,
 				  unsigned int size, unsigned int rnd)
 {
@@ -280,6 +284,15 @@ static void death_by_timeout(unsigned long ul_conntrack)
 	}
 	set_bit(IPS_DYING_BIT, &ct->status);
 	nf_ct_delete_from_lists(ct);
+	nf_ct_put(ct);
+}
+
+static void kick_off_existed_conntrack(struct nf_conn *ct)
+{
+	/* Time to push up daises... */
+	if (del_timer(&ct->timeout))
+		death_by_timeout((unsigned long)ct);
+	/* ... else the timer will get him soon. */
 	nf_ct_put(ct);
 }
 
@@ -535,9 +548,14 @@ static noinline int early_drop(struct net *net, unsigned int hash)
 struct nf_conn *nf_conntrack_alloc(struct net *net,
 				   const struct nf_conntrack_tuple *orig,
 				   const struct nf_conntrack_tuple *repl,
-				   gfp_t gfp)
+				   gfp_t gfp, struct sk_buff *skb)
 {
 	struct nf_conn *ct;
+	u32 lan_ip_new = 0;
+	u32 lan_ip_max = 0;
+	unsigned int sessions_of_ip_new = 0;
+	unsigned int sessions_of_ip_max = 0;
+	struct nf_conn *victim = NULL;
 
 	if (unlikely(!nf_conntrack_hash_rnd_initted)) {
 		get_random_bytes(&nf_conntrack_hash_rnd,
@@ -548,16 +566,79 @@ struct nf_conn *nf_conntrack_alloc(struct net *net,
 	/* We don't want any race condition at early drop stage */
 	atomic_inc(&net->ct.count);
 
+	/* According to NETGEAR Spec 2.0, the conntrack table is full should be the first judgement condition. */
 	if (nf_conntrack_max &&
 	    unlikely(atomic_read(&net->ct.count) > nf_conntrack_max)) {
-		unsigned int hash = hash_conntrack(orig);
-		if (!early_drop(net, hash)) {
-			atomic_dec(&net->ct.count);
-			if (net_ratelimit())
-				printk(KERN_WARNING
-				       "nf_conntrack: table full, dropping"
-				       " packet.\n");
-			return ERR_PTR(-ENOMEM);
+		/* Disable NAT Session Management or skb is from netlink (skb is NULL)*/
+		if(sysctl_enable_nat_management == 0 || skb == NULL || skb_is_ipv6_packet(skb) || tuple_is_router_traffic(orig)/*Router's traffic still applies kernel original session management*/) 
+		{
+			/* This is the original kernel NAT management. */
+			unsigned int hash = hash_conntrack(orig);
+			if (!early_drop(net, hash)) {
+				atomic_dec(&net->ct.count);
+				if (net_ratelimit()) {
+					printk(KERN_WARNING
+					       "NAT Session Management Disabled"
+					       " or this conntrack comes from "
+					       "netlink.\n");
+					printk(KERN_WARNING
+					       "nf_conntrack: table full, dropping"
+					       " packet.\n");
+				}
+				return ERR_PTR(-ENOMEM);
+			}
+		} else {
+			/* This is the new NAT management to meet the new requirements of NETGEAR Spec 2.0 */
+
+			/* According to NETGEAR Router Spec 2.0, 
+			 * NAT management should only manage new NAT sessions and existing NAT sessions. */
+			unsigned int hash = hash_conntrack(orig);
+			if (!early_drop(net, hash)) {
+				pr_debug("New session: %u.%u.%u.%u:%u(%u.%u.%u.%u:%u) <==> %u.%u.%u.%u:%u(%u.%u.%u.%u:%u)\n", NIPQUAD(orig->src.u3.ip), ntohs(orig->src.u.all), NIPQUAD(repl->dst.u3.ip), ntohs(repl->dst.u.all), NIPQUAD(orig->dst.u3.ip), ntohs(orig->dst.u.all), NIPQUAD(repl->src.u3.ip), ntohs(repl->src.u.all));
+				/* We remove conntrack_table_really_full() judgement,
+				 * because nf_conntrack_max should the total limitation for all of sessions. */
+				if (tuple_initiated_from_inside(orig) == 0)
+					lan_ip_new = lan_ip_of_wan_orig_tuple(net, skb, orig);
+				else
+					lan_ip_new = ntohl(orig->src.u3.ip);
+				if (lan_ip_new == 0) {
+					atomic_dec(&net->ct.count);
+					pr_debug("lan_ip_new is 0, "
+					         "Drop this conntrack\n");
+					return ERR_PTR(-ENOMEM);
+				}
+				sessions_of_ip_new = number_of_session(net, lan_ip_new);
+				lan_ip_max = get_lan_ip_max_from_conntracks(net, &sessions_of_ip_max);
+				/* This is the race condition that all of the conntracks are router's sessions */
+				if(lan_ip_max == 0 && sessions_of_ip_max == 0){
+					atomic_dec(&net->ct.count);
+					if (net_ratelimit())
+						printk(KERN_WARNING
+						       "There is no NAT session in conntrack table."
+						       "Maybe conntrack table is full of router's sessions!\n");
+					return ERR_PTR(-ENOMEM);
+				}
+				victim = find_victim_from_conntracks(net,
+				                                     orig, repl,
+				                                     lan_ip_new, lan_ip_max,
+				                                     sessions_of_ip_new,
+				                                     sessions_of_ip_max);
+				if (victim == NULL) {
+					atomic_dec(&net->ct.count);
+					if (net_ratelimit())
+						printk(KERN_WARNING
+						       "NAT Session "
+						       "Management: "
+						       "Fail to find "
+						       "low-priority "
+						       "session or "
+						       "new session is "
+						       "low-priority, "
+						       "dropping packet.\n");
+					return ERR_PTR(-ENOMEM);
+				} else
+					kick_off_existed_conntrack(victim);
+			}
 		}
 	}
 
@@ -612,7 +693,7 @@ EXPORT_SYMBOL_GPL(nf_conntrack_free);
    failed due to stress.  Otherwise it really is unclassifiable. */
 static struct nf_conntrack_tuple_hash *
 init_conntrack(struct net *net,
-	       const struct nf_conntrack_tuple *tuple,
+	       struct nf_conntrack_tuple *tuple,
 	       struct nf_conntrack_l3proto *l3proto,
 	       struct nf_conntrack_l4proto *l4proto,
 	       struct sk_buff *skb,
@@ -627,8 +708,14 @@ init_conntrack(struct net *net,
 		pr_debug("Can't invert tuple.\n");
 		return NULL;
 	}
-
-	ct = nf_conntrack_alloc(net, tuple, &repl_tuple, GFP_ATOMIC);
+#ifdef CONFIG_ATHRS_HW_NAT
+        if ((skb->ath_hw_nat_fw_flags == 3) && athr_nat_sw_ops) {
+                athr_get_wan_addr = rcu_dereference(athr_nat_sw_ops->get_wan_ipaddr);
+                if (athr_get_wan_addr)
+                        athr_get_wan_addr(&tuple->dst.u3.ip,index);
+        }
+#endif
+	ct = nf_conntrack_alloc(net, tuple, &repl_tuple, GFP_ATOMIC, skb);
 	if (IS_ERR(ct)) {
 		pr_debug("Can't allocate conntrack.\n");
 		return (struct nf_conntrack_tuple_hash *)ct;
@@ -1106,6 +1193,7 @@ static void nf_ct_release_dying_list(void)
 
 static void nf_conntrack_cleanup_init_net(void)
 {
+	kmem_cache_destroy(nf_ct_natlan_cachep);
 	nf_conntrack_helper_fini();
 	nf_conntrack_proto_fini();
 	kmem_cache_destroy(nf_conntrack_cachep);
@@ -1281,8 +1369,16 @@ static int nf_conntrack_init_init_net(void)
 	if (ret < 0)
 		goto err_helper;
 
+	nf_ct_natlan_cachep = kmem_cache_create("nf_ct_natlan",
+						sizeof(struct nf_conn_lan),
+						0, 0, NULL);
+	if (!nf_ct_natlan_cachep)
+		goto err_natlan;
+
 	return 0;
 
+err_natlan:
+	nf_conntrack_helper_fini();
 err_helper:
 	nf_conntrack_proto_fini();
 err_proto:
